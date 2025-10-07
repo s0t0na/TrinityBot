@@ -43,6 +43,11 @@ type PostRepository interface {
 	GetPost(ctx context.Context, id int64) (*Post, error)
 	SetTargetStatus(ctx context.Context, postID int64, platform string, status string, externalID *string, errText *string) error
 	AddLog(ctx context.Context, postID int64, platform *string, event, detail string) error
+	AddMedia(ctx context.Context, postID int64, fileID string, mediaType string) (int64, error)
+	ListMedia(ctx context.Context, postID int64) ([]PostMedia, error)
+	CountMedia(ctx context.Context, postID int64) (int, error)
+	UpdatePostText(ctx context.Context, postID int64, text string) error
+	AppendPostText(ctx context.Context, postID int64, text string) error
 }
 
 type repo struct {
@@ -155,6 +160,72 @@ func (r *repo) AddLog(ctx context.Context, postID int64, platform *string, event
 	_, err := r.db.ExecContext(ctx, `INSERT INTO post_logs (post_id, platform, event, detail) VALUES ($1,$2,$3,$4)`, postID, platform, event, detail)
 	if err != nil {
 		return fmt.Errorf("add log: %w", err)
+	}
+	return nil
+}
+
+type PostMedia struct {
+	ID       int64
+	PostID   int64
+	FileID   string
+	Type     string
+	Position int
+}
+
+func (r *repo) AddMedia(ctx context.Context, postID int64, fileID string, mediaType string) (int64, error) {
+	// Determine next position
+	var pos int
+	if err := r.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(position)+1,0) FROM post_media WHERE post_id=$1`, postID).Scan(&pos); err != nil {
+		return 0, fmt.Errorf("next pos: %w", err)
+	}
+	var id int64
+	if mediaType == "" {
+		mediaType = "photo"
+	}
+	err := r.db.QueryRowContext(ctx, `INSERT INTO post_media (post_id, file_id, media_type, position) VALUES ($1,$2,$3,$4) RETURNING id`, postID, fileID, mediaType, pos).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("insert media: %w", err)
+	}
+	return id, nil
+}
+
+func (r *repo) ListMedia(ctx context.Context, postID int64) ([]PostMedia, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id, post_id, file_id, media_type, position FROM post_media WHERE post_id=$1 ORDER BY position ASC`, postID)
+	if err != nil {
+		return nil, fmt.Errorf("list media: %w", err)
+	}
+	defer rows.Close()
+	var out []PostMedia
+	for rows.Next() {
+		var m PostMedia
+		if err := rows.Scan(&m.ID, &m.PostID, &m.FileID, &m.Type, &m.Position); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (r *repo) CountMedia(ctx context.Context, postID int64) (int, error) {
+	var c int
+	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM post_media WHERE post_id=$1`, postID).Scan(&c); err != nil {
+		return 0, fmt.Errorf("count media: %w", err)
+	}
+	return c, nil
+}
+
+func (r *repo) UpdatePostText(ctx context.Context, postID int64, text string) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE posts SET text_content=$2, updated_at=NOW() WHERE id=$1`, postID, text)
+	if err != nil {
+		return fmt.Errorf("update post text: %w", err)
+	}
+	return nil
+}
+
+func (r *repo) AppendPostText(ctx context.Context, postID int64, text string) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE posts SET text_content = CASE WHEN text_content IS NULL OR text_content = '' THEN $2 ELSE text_content || E'\n' || $2 END, updated_at=NOW() WHERE id=$1`, postID, text)
+	if err != nil {
+		return fmt.Errorf("append post text: %w", err)
 	}
 	return nil
 }

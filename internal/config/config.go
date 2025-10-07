@@ -33,6 +33,14 @@ type Config struct {
 	// Pinterest
 	PinterestAccessToken string
 	PinterestBoardID     string
+
+	// Facebook (Page publishing)
+	FacebookAccessToken string
+	FacebookPageID      string
+
+	// Instagram (IG Graph API)
+	InstagramAccessToken string
+	InstagramUserID      string
 }
 
 // Load loads configuration from environment variables
@@ -133,6 +141,12 @@ func Load() (*Config, error) {
 	// Pinterest
 	config.PinterestAccessToken = os.Getenv("PINTEREST_ACCESS_TOKEN")
 	config.PinterestBoardID = os.Getenv("PINTEREST_BOARD_ID")
+
+	// Facebook / Instagram
+	config.FacebookAccessToken = os.Getenv("FACEBOOK_ACCESS_TOKEN")
+	config.FacebookPageID = os.Getenv("FACEBOOK_PAGE_ID")
+	config.InstagramAccessToken = os.Getenv("INSTAGRAM_ACCESS_TOKEN")
+	config.InstagramUserID = os.Getenv("INSTAGRAM_USER_ID")
 
 	return config, nil
 }

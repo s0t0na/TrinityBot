@@ -65,7 +65,9 @@ The bot can be configured using environment variables:
 - `DATABASE_URL` (recommended): Postgres connection string. If empty, the app falls back to `POSTGRES_*` variables.
 - `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` (fallback if `DATABASE_URL` not set)
 - `TWITTER_CONSUMER_KEY`, `TWITTER_CONSUMER_SECRET`, `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_SECRET` for X/Twitter posting
- - `PINTEREST_ACCESS_TOKEN`, `PINTEREST_BOARD_ID` for Pinterest posting
+- `PINTEREST_ACCESS_TOKEN`, `PINTEREST_BOARD_ID` for Pinterest posting
+ - `FACEBOOK_ACCESS_TOKEN`, `FACEBOOK_PAGE_ID` for Facebook Page posting
+ - `INSTAGRAM_ACCESS_TOKEN`, `INSTAGRAM_USER_ID` for Instagram Graph posting (Business/Creator account)
 
 ## Project Structure
 
@@ -115,6 +117,8 @@ project-root/
 - Press "Publish" to queue the post (integrations will be wired next).
 - X/Twitter connector: When selected, pressing Publish attempts to post immediately (text and images supported).
 - Pinterest connector: Requires an image; pressing Publish will upload the photo and create a pin on the configured board.
+ - Facebook connector: Posts a text status or uploads a photo with caption to the configured Page.
+ - Instagram connector: Requires an image. Uses Instagram Graph API; image must be publicly accessible. For now, the bot uses the Telegram file URL which is public but embeds your bot token in the URL. Consider replacing with your own CDN for production.
 
 ### Adding a New Command
 

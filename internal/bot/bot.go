@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -23,6 +24,9 @@ type Bot struct {
 	server   *http.Server // For webhook mode
 	stopChan chan struct{}
 	repo     storage.PostRepository
+
+	mu       sync.Mutex
+	sessions map[int64]*PostSession // key: chatID
 }
 
 // New creates a new bot instance
@@ -42,6 +46,7 @@ func New(cfg *config.Config, repo storage.PostRepository) (*Bot, error) {
 		config:   cfg,
 		stopChan: make(chan struct{}),
 		repo:     repo,
+		sessions: make(map[int64]*PostSession),
 	}
 
 	slog.Info("Authorized on Telegram", "username", api.Self.UserName)
@@ -182,4 +187,42 @@ func (b *Bot) downloadTelegramFile(ctx context.Context, fileID string) ([]byte, 
 		ctype = "application/octet-stream"
 	}
 	return data, ctype, nil
+}
+
+// getTelegramFileURL returns a publicly accessible URL for a Telegram fileID.
+func (b *Bot) getTelegramFileURL(fileID string) (string, error) {
+	f, err := b.api.GetFile(tgbotapi.FileConfig{FileID: fileID})
+	if err != nil {
+		return "", fmt.Errorf("get file: %w", err)
+	}
+	if f.FilePath == "" {
+		return "", fmt.Errorf("empty file path for fileID %s", fileID)
+	}
+	raw := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", url.PathEscape(b.api.Token), f.FilePath)
+	return raw, nil
+}
+
+type PostSession struct {
+	PostID     int64
+	Step       string // compose | confirm
+	MediaCount int
+}
+
+func (b *Bot) setSession(chatID int64, s *PostSession) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sessions[chatID] = s
+}
+
+func (b *Bot) getSession(chatID int64) (*PostSession, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.sessions[chatID]
+	return s, ok
+}
+
+func (b *Bot) clearSession(chatID int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.sessions, chatID)
 }

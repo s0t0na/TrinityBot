@@ -9,6 +9,8 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"trinity_bot/internal/connectors/facebook"
+	"trinity_bot/internal/connectors/instagram"
 	"trinity_bot/internal/connectors/pinterest"
 	"trinity_bot/internal/connectors/twitter"
 	"trinity_bot/internal/storage"
@@ -37,6 +39,71 @@ func (b *Bot) handleMessage(message *tgbotapi.Message) {
 	if message.IsCommand() {
 		b.handleCommand(message)
 		return
+	}
+
+	// If in a /post session, consume input for the current step
+	if s, ok := b.getSession(message.Chat.ID); ok {
+		switch s.Step {
+		case "compose":
+			ctx, cancel := b.dbCtx()
+			defer cancel()
+			contentAdded := false
+			// Photo (with optional caption)
+			if message.Photo != nil && len(message.Photo) > 0 {
+				cnt, _ := b.repo.CountMedia(ctx, s.PostID)
+				if cnt < 10 {
+					ps := message.Photo[len(message.Photo)-1]
+					if _, err := b.repo.AddMedia(ctx, s.PostID, ps.FileID, "photo"); err == nil {
+						cnt++
+						_, _ = b.SendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("Photo added (%d/10).", cnt))
+						contentAdded = true
+						if cap := strings.TrimSpace(message.Caption); cap != "" {
+							_ = b.repo.AppendPostText(ctx, s.PostID, cap)
+						}
+					} else {
+						slog.Error("add media error", "err", err)
+					}
+				} else {
+					_, _ = b.SendReply(message.Chat.ID, message.MessageID, "You already added 10 items.")
+				}
+			}
+			// Video (with optional caption)
+			if message.Video != nil {
+				cnt, _ := b.repo.CountMedia(ctx, s.PostID)
+				if cnt < 10 {
+					if _, err := b.repo.AddMedia(ctx, s.PostID, message.Video.FileID, "video"); err == nil {
+						cnt++
+						_, _ = b.SendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("Video added (%d/10).", cnt))
+						contentAdded = true
+						if cap := strings.TrimSpace(message.Caption); cap != "" {
+							_ = b.repo.AppendPostText(ctx, s.PostID, cap)
+						}
+					} else {
+						slog.Error("add media error", "err", err)
+					}
+				} else {
+					_, _ = b.SendReply(message.Chat.ID, message.MessageID, "You already added 10 items.")
+				}
+			}
+			// Text (append)
+			if t := strings.TrimSpace(message.Text); t != "" {
+				if err := b.repo.AppendPostText(ctx, s.PostID, t); err != nil {
+					slog.Error("append post text error", "err", err)
+				} else {
+					_, _ = b.SendReply(message.Chat.ID, message.MessageID, "Text added.")
+					contentAdded = true
+				}
+			}
+			if contentAdded {
+				kb, _ := b.buildConfirmTargetsMarkup(ctx, s.PostID)
+				m := tgbotapi.NewMessage(message.Chat.ID, "Select platforms and press Confirm when ready.")
+				m.ReplyMarkup = kb
+				_, _ = b.api.Send(m)
+			} else {
+				_, _ = b.SendReply(message.Chat.ID, message.MessageID, "Please send photos/videos and text in captions, then press Confirm.")
+			}
+			return
+		}
 	}
 
 	// Create a draft post from message (text or photo+caption)
@@ -103,6 +170,8 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 		b.handleStartCommand(message)
 	case "help":
 		b.handleHelpCommand(message)
+	case "post":
+		b.handlePostCommand(message)
 	default:
 		_, err := b.SendReply(message.Chat.ID, message.MessageID, "Unknown command. Try /help")
 		if err != nil {
@@ -126,6 +195,11 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 	}
 
 	action := parts[0]
+	// If this is part of the post setup flow (ps:*), route directly and return.
+	if action == "ps" {
+		b.handlePostSetupCallback(query)
+		return
+	}
 	postID64, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
 		_, _ = b.api.Request(tgbotapi.NewCallback(query.ID, "Invalid post id"))
@@ -188,7 +262,98 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 		msg := tgbotapi.NewMessage(query.Message.Chat.ID, fmt.Sprintf("Post #%d canceled.", postID64))
 		_, _ = b.api.Send(msg)
 	default:
-		_, _ = b.api.Request(tgbotapi.NewCallback(query.ID, "Unknown action"))
+		// Post setup actions: ps:toggle, ps:confirm, ps:cancel
+		if strings.HasPrefix(action, "ps") {
+			b.handlePostSetupCallback(query)
+		} else {
+			_, _ = b.api.Request(tgbotapi.NewCallback(query.ID, "Unknown action"))
+		}
+	}
+}
+
+// handlePostCommand starts the guided post creation flow
+func (b *Bot) handlePostCommand(message *tgbotapi.Message) {
+	ctx, cancel := b.dbCtx()
+	defer cancel()
+	// Create draft
+	postID, err := b.repo.CreatePost(ctx, &storage.Post{
+		TelegramUserID: message.From.ID,
+		ChatID:         message.Chat.ID,
+		MessageID:      message.MessageID,
+		Type:           "text",
+		TextContent:    "",
+	})
+	if err != nil {
+		slog.Error("create post (cmd) error", "err", err)
+		_, _ = b.SendReply(message.Chat.ID, message.MessageID, "Failed to start post creation. Please try again.")
+		return
+	}
+	// Compose mode prompt: ask for media/text first; checklist after content arrives
+	b.setSession(message.Chat.ID, &PostSession{PostID: postID, Step: "compose"})
+	row := tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("Cancel", fmt.Sprintf("ps:cancel:%d", postID)),
+	)
+	m := tgbotapi.NewMessage(message.Chat.ID, "Please send pictures (up to 10) and text for the post (in a caption).")
+	m.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(row)
+	_, _ = b.api.Send(m)
+}
+
+func (b *Bot) handlePostSetupCallback(q *tgbotapi.CallbackQuery) {
+	parts := strings.Split(q.Data, ":")
+	if len(parts) < 2 {
+		_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, "Invalid"))
+		return
+	}
+	action := parts[1]
+	// Expect formats: ps:toggle:<postID>:<platform>, ps:confirm:<postID>, ps:cancel:<postID>
+	switch action {
+	case "toggle":
+		if len(parts) != 4 {
+			_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, "Invalid toggle"))
+			return
+		}
+		postID, _ := strconv.ParseInt(parts[2], 10, 64)
+		platform := parts[3]
+		ctx, cancel := b.dbCtx()
+		defer cancel()
+		if _, err := b.repo.ToggleTarget(ctx, postID, platform); err != nil {
+			slog.Error("toggle (setup) error", "err", err)
+		}
+		kb, _ := b.buildConfirmTargetsMarkup(ctx, postID)
+		edit := tgbotapi.NewEditMessageReplyMarkup(q.Message.Chat.ID, q.Message.MessageID, kb)
+		_, _ = b.api.Request(edit)
+		_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, "Updated"))
+	case "confirm":
+		if len(parts) != 3 {
+			_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, "Invalid"))
+			return
+		}
+		postID, _ := strconv.ParseInt(parts[2], 10, 64)
+		ctx, cancel := b.dbCtx()
+		defer cancel()
+		_ = b.repo.SetPostStatus(ctx, postID, "queued")
+		if err := b.publishSelected(ctx, postID); err != nil {
+			slog.Error("publish (confirm) error", "err", err, "post_id", postID)
+			_, _ = b.api.Send(tgbotapi.NewMessage(q.Message.Chat.ID, fmt.Sprintf("Publish failed: %v", err)))
+		} else {
+			_, _ = b.api.Send(tgbotapi.NewMessage(q.Message.Chat.ID, "Published to selected platforms."))
+		}
+		b.clearSession(q.Message.Chat.ID)
+		_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, "Done"))
+	case "cancel":
+		if len(parts) != 3 {
+			_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, "Invalid"))
+			return
+		}
+		postID, _ := strconv.ParseInt(parts[2], 10, 64)
+		ctx, cancel := b.dbCtx()
+		defer cancel()
+		_ = b.repo.SetPostStatus(ctx, postID, "canceled")
+		b.clearSession(q.Message.Chat.ID)
+		_, _ = b.api.Send(tgbotapi.NewMessage(q.Message.Chat.ID, "Post creation canceled."))
+		_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, "Canceled"))
+	default:
+		_, _ = b.api.Request(tgbotapi.NewCallback(q.ID, "Unknown"))
 	}
 }
 
@@ -233,6 +398,7 @@ func (b *Bot) handleHelpCommand(message *tgbotapi.Message) {
 Available commands:
 /start - Start the bot
 /help - Show this help message
+/post - Create a new post: send photos/videos (up to 10) and/or text → select platforms → confirm
 Send a text message or a photo with caption to create a draft post.
 Use the buttons to select platforms and publish.
 `
@@ -275,6 +441,58 @@ func (b *Bot) buildTargetsMarkup(ctx context.Context, postID int64) (tgbotapi.In
 	return tgbotapi.NewInlineKeyboardMarkup(row1, row2, actions), nil
 }
 
+// buildSetupTargetsMarkup is like buildTargetsMarkup but uses ps:toggle callbacks and appends Next/Cancel row.
+func (b *Bot) buildSetupTargetsMarkup(ctx context.Context, postID int64) (tgbotapi.InlineKeyboardMarkup, error) {
+	selected, err := b.repo.ListTargets(ctx, postID)
+	if err != nil {
+		return tgbotapi.InlineKeyboardMarkup{}, err
+	}
+	btn := func(name, key string) tgbotapi.InlineKeyboardButton {
+		label := name
+		if selected[key] {
+			label = "✅ " + name
+		}
+		return tgbotapi.NewInlineKeyboardButtonData(label, fmt.Sprintf("ps:toggle:%d:%s", postID, key))
+	}
+	row1 := tgbotapi.NewInlineKeyboardRow(
+		btn("Twitter", "twitter"), btn("Pinterest", "pinterest"), btn("Facebook", "facebook"),
+	)
+	row2 := tgbotapi.NewInlineKeyboardRow(
+		btn("Instagram", "instagram"), btn("TikTok", "tiktok"),
+	)
+	next := tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("Next ▶️ Media", fmt.Sprintf("ps:media:%d", postID)),
+		tgbotapi.NewInlineKeyboardButtonData("Cancel", fmt.Sprintf("ps:cancel:%d", postID)),
+	)
+	return tgbotapi.NewInlineKeyboardMarkup(row1, row2, next), nil
+}
+
+// buildConfirmTargetsMarkup shows toggles and Confirm/Cancel.
+func (b *Bot) buildConfirmTargetsMarkup(ctx context.Context, postID int64) (tgbotapi.InlineKeyboardMarkup, error) {
+	selected, err := b.repo.ListTargets(ctx, postID)
+	if err != nil {
+		return tgbotapi.InlineKeyboardMarkup{}, err
+	}
+	btn := func(name, key string) tgbotapi.InlineKeyboardButton {
+		label := name
+		if selected[key] {
+			label = "✅ " + name
+		}
+		return tgbotapi.NewInlineKeyboardButtonData(label, fmt.Sprintf("ps:toggle:%d:%s", postID, key))
+	}
+	row1 := tgbotapi.NewInlineKeyboardRow(
+		btn("Twitter", "twitter"), btn("Pinterest", "pinterest"), btn("Facebook", "facebook"),
+	)
+	row2 := tgbotapi.NewInlineKeyboardRow(
+		btn("Instagram", "instagram"), btn("TikTok", "tiktok"),
+	)
+	actions := tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("Confirm ✅", fmt.Sprintf("ps:confirm:%d", postID)),
+		tgbotapi.NewInlineKeyboardButtonData("Cancel", fmt.Sprintf("ps:cancel:%d", postID)),
+	)
+	return tgbotapi.NewInlineKeyboardMarkup(row1, row2, actions), nil
+}
+
 // publishSelected publishes the post to all currently selected targets.
 func (b *Bot) publishSelected(ctx context.Context, postID int64) error {
 	selections, err := b.repo.ListTargets(ctx, postID)
@@ -292,6 +510,16 @@ func (b *Bot) publishSelected(ctx context.Context, postID int64) error {
 	}
 	if selections["pinterest"] {
 		if err := b.publishToPinterest(ctx, post); err != nil {
+			return err
+		}
+	}
+	if selections["facebook"] {
+		if err := b.publishToFacebook(ctx, post); err != nil {
+			return err
+		}
+	}
+	if selections["instagram"] {
+		if err := b.publishToInstagram(ctx, post); err != nil {
 			return err
 		}
 	}
@@ -319,18 +547,35 @@ func (b *Bot) publishToTwitter(ctx context.Context, p *storage.Post) error {
 
 	var media [][]byte
 	var mediaTypes []string
-	if p.PhotoFileID != nil {
+	// Prefer multiple from post_media; fallback to single PhotoFileID
+	if items, err := b.repo.ListMedia(ctx, p.ID); err == nil && len(items) > 0 {
+		max := len(items)
+		if max > 4 {
+			max = 4
+		}
+		for i := 0; i < max; i++ {
+			if strings.ToLower(items[i].Type) != "photo" {
+				continue
+			}
+			data, ctype, err := b.downloadTelegramFile(ctx, items[i].FileID)
+			if err != nil {
+				continue
+			}
+			if ctype == "application/octet-stream" || ctype == "" {
+				ctype = "image/jpeg"
+			}
+			media = append(media, data)
+			mediaTypes = append(mediaTypes, ctype)
+		}
+	} else if p.PhotoFileID != nil {
 		data, ctype, err := b.downloadTelegramFile(ctx, *p.PhotoFileID)
-		if err != nil {
-			_ = b.repo.SetTargetStatus(ctx, p.ID, "twitter", "failed", nil, strptr(err.Error()))
-			_ = b.repo.AddLog(ctx, p.ID, ptr("twitter"), "error", "telegram download: "+err.Error())
-			return err
+		if err == nil {
+			if ctype == "application/octet-stream" || ctype == "" {
+				ctype = "image/jpeg"
+			}
+			media = append(media, data)
+			mediaTypes = append(mediaTypes, ctype)
 		}
-		if ctype == "application/octet-stream" || ctype == "" {
-			ctype = "image/jpeg"
-		}
-		media = append(media, data)
-		mediaTypes = append(mediaTypes, ctype)
 	}
 	tweetID, err := twc.Publish(ctx, p.TextContent, media, mediaTypes)
 	if err != nil {
@@ -350,14 +595,28 @@ func (b *Bot) publishToPinterest(ctx context.Context, p *storage.Post) error {
 		_ = b.repo.AddLog(ctx, p.ID, ptr("pinterest"), "error", msg)
 		return fmt.Errorf(msg)
 	}
-	if p.PhotoFileID == nil {
+	// Use first media if available, else single photo
+	var fileID string
+	if items, err := b.repo.ListMedia(ctx, p.ID); err == nil && len(items) > 0 {
+		for _, it := range items {
+			if strings.ToLower(it.Type) == "photo" {
+				fileID = it.FileID
+				break
+			}
+		}
+	} else {
+		if p.PhotoFileID != nil {
+			fileID = *p.PhotoFileID
+		}
+	}
+	if fileID == "" {
 		msg := "Pinterest requires an image"
 		_ = b.repo.SetTargetStatus(ctx, p.ID, "pinterest", "failed", nil, &msg)
 		_ = b.repo.AddLog(ctx, p.ID, ptr("pinterest"), "error", msg)
 		return fmt.Errorf(msg)
 	}
 	// Download image from Telegram
-	data, ctype, err := b.downloadTelegramFile(ctx, *p.PhotoFileID)
+	data, ctype, err := b.downloadTelegramFile(ctx, fileID)
 	if err != nil {
 		_ = b.repo.SetTargetStatus(ctx, p.ID, "pinterest", "failed", nil, strptr(err.Error()))
 		_ = b.repo.AddLog(ctx, p.ID, ptr("pinterest"), "error", "telegram download: "+err.Error())
@@ -386,6 +645,104 @@ func (b *Bot) publishToPinterest(ctx context.Context, p *storage.Post) error {
 	}
 	_ = b.repo.SetTargetStatus(ctx, p.ID, "pinterest", "published", &pinID, nil)
 	_ = b.repo.AddLog(ctx, p.ID, ptr("pinterest"), "published", "pin_id="+pinID)
+	return nil
+}
+
+func (b *Bot) publishToFacebook(ctx context.Context, p *storage.Post) error {
+	if b.config.FacebookAccessToken == "" || b.config.FacebookPageID == "" {
+		msg := "Facebook access token or page ID missing"
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "facebook", "failed", nil, &msg)
+		_ = b.repo.AddLog(ctx, p.ID, ptr("facebook"), "error", msg)
+		return fmt.Errorf(msg)
+	}
+	cli, err := facebook.New(facebook.Credentials{AccessToken: b.config.FacebookAccessToken})
+	if err != nil {
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "facebook", "failed", nil, strptr(err.Error()))
+		_ = b.repo.AddLog(ctx, p.ID, ptr("facebook"), "error", err.Error())
+		return err
+	}
+	var img []byte
+	var ctype string
+	if items, err := b.repo.ListMedia(ctx, p.ID); err == nil && len(items) > 0 {
+		var fid string
+		for _, it := range items {
+			if strings.ToLower(it.Type) == "photo" {
+				fid = it.FileID
+				break
+			}
+		}
+		if fid != "" {
+			img, ctype, err = b.downloadTelegramFile(ctx, fid)
+			if err != nil {
+				img = nil
+			}
+		}
+	} else if p.PhotoFileID != nil {
+		img, ctype, err = b.downloadTelegramFile(ctx, *p.PhotoFileID)
+		if err != nil {
+			_ = b.repo.SetTargetStatus(ctx, p.ID, "facebook", "failed", nil, strptr(err.Error()))
+			_ = b.repo.AddLog(ctx, p.ID, ptr("facebook"), "error", "telegram download: "+err.Error())
+			return err
+		}
+	}
+	id, err := cli.CreatePost(ctx, b.config.FacebookPageID, p.TextContent, img, ctype)
+	if err != nil {
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "facebook", "failed", nil, strptr(err.Error()))
+		_ = b.repo.AddLog(ctx, p.ID, ptr("facebook"), "error", err.Error())
+		return err
+	}
+	_ = b.repo.SetTargetStatus(ctx, p.ID, "facebook", "published", &id, nil)
+	_ = b.repo.AddLog(ctx, p.ID, ptr("facebook"), "published", "id="+id)
+	return nil
+}
+
+func (b *Bot) publishToInstagram(ctx context.Context, p *storage.Post) error {
+	if b.config.InstagramAccessToken == "" || b.config.InstagramUserID == "" {
+		msg := "Instagram access token or user ID missing"
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "instagram", "failed", nil, &msg)
+		_ = b.repo.AddLog(ctx, p.ID, ptr("instagram"), "error", msg)
+		return fmt.Errorf(msg)
+	}
+	// Prefer first media if present
+	var fileID string
+	if items, err := b.repo.ListMedia(ctx, p.ID); err == nil && len(items) > 0 {
+		for _, it := range items {
+			if strings.ToLower(it.Type) == "photo" {
+				fileID = it.FileID
+				break
+			}
+		}
+	} else {
+		if p.PhotoFileID != nil {
+			fileID = *p.PhotoFileID
+		}
+	}
+	if fileID == "" {
+		msg := "Instagram requires an image"
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "instagram", "failed", nil, &msg)
+		_ = b.repo.AddLog(ctx, p.ID, ptr("instagram"), "error", msg)
+		return fmt.Errorf(msg)
+	}
+	imgURL, err := b.getTelegramFileURL(fileID)
+	if err != nil {
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "instagram", "failed", nil, strptr(err.Error()))
+		_ = b.repo.AddLog(ctx, p.ID, ptr("instagram"), "error", "telegram get url: "+err.Error())
+		return err
+	}
+	cli, err := instagram.New(instagram.Credentials{AccessToken: b.config.InstagramAccessToken})
+	if err != nil {
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "instagram", "failed", nil, strptr(err.Error()))
+		_ = b.repo.AddLog(ctx, p.ID, ptr("instagram"), "error", err.Error())
+		return err
+	}
+	id, err := cli.CreatePhotoPost(ctx, b.config.InstagramUserID, p.TextContent, imgURL)
+	if err != nil {
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "instagram", "failed", nil, strptr(err.Error()))
+		_ = b.repo.AddLog(ctx, p.ID, ptr("instagram"), "error", err.Error())
+		return err
+	}
+	_ = b.repo.SetTargetStatus(ctx, p.ID, "instagram", "published", &id, nil)
+	_ = b.repo.AddLog(ctx, p.ID, ptr("instagram"), "published", "id="+id)
 	return nil
 }
 
