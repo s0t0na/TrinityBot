@@ -1,16 +1,37 @@
 version: '3.8'
 
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: trinitybot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trinitybot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trinitybot}
+      POSTGRES_DB: ${POSTGRES_DB:-trinitybot}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
   bot:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
     container_name: telegram-bot
     restart: unless-stopped
     env_file:
-      - .env
+      - ../.env
+    environment:
+      # Prefer container DNS name for DB host
+      DATABASE_URL: ${DATABASE_URL:-postgres://trinitybot:trinitybot@db:5432/trinitybot?sslmode=disable}
+    depends_on:
+      - db
     volumes:
-      - ./data:/app/data
-    # If using webhooks, you need to expose the port
+      - ../data:/app/data
+    # If using webhooks, expose the port
     # ports:
     #   - "8443:8443"
+
+volumes:
+  pgdata:

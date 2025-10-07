@@ -26,10 +26,10 @@ A simple and clean Telegram bot written in Go using the official Telegram Bot AP
    cd telegrambot
    ```
 
-2. Copy the example environment file and add your bot token:
+2. Copy the example environment file and add your bot token and DB variables:
    ```bash
    cp .env.example .env
-   # Edit .env and add your Telegram bot token
+   # Edit .env and add your Telegram bot token and DATABASE_URL
    ```
 
 3. Build and run the bot:
@@ -40,10 +40,18 @@ A simple and clean Telegram bot written in Go using the official Telegram Bot AP
 
 ### Using Docker
 
-1. Build and run with Docker Compose:
+1. Start Postgres and the bot with Docker Compose (defined under `docker/`):
    ```bash
-   docker-compose up -d
+   cd docker
+   docker compose up -d
    ```
+
+The compose file includes a `postgres:16-alpine` service and sets the bot's `DATABASE_URL` to the Postgres container by default.
+
+If you run the bot directly on your host (without Docker), ensure Postgres is running locally and set `DATABASE_URL`, for example:
+```
+DATABASE_URL=postgres://trinitybot:trinitybot@localhost:5432/trinitybot?sslmode=disable
+```
 
 ## Configuration
 
@@ -54,6 +62,8 @@ The bot can be configured using environment variables:
 - `WEBHOOK_URL` (optional): URL for webhook mode (if not set, uses long polling)
 - `PORT` (optional): Port for webhook server (default: 8443)
 - `ALLOWED_USERS` (optional): Comma-separated list of allowed user IDs
+- `DATABASE_URL` (recommended): Postgres connection string. If empty, the app falls back to `POSTGRES_*` variables.
+- `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` (fallback if `DATABASE_URL` not set)
 
 ## Project Structure
 
@@ -69,8 +79,14 @@ project-root/
 │   │   └── middleware.go         # Any middleware for handling messages
 │   ├── config/
 │   │   └── config.go             # Configuration loading and management
+│   ├── db/
+│   │   ├── db.go                 # Postgres connection + embedded migration runner
+│   │   └── migrations/
+│   │       └── 0001_init.sql     # Initial schema for posts/targets/logs
 │   └── service/
 │       └── service.go            # Business logic services
+│   └── storage/
+│       └── posts.go              # Post repository (CRUD + targets)
 ├── pkg/
 │   └── utils/
 │       └── utils.go              # Shared utility functions
@@ -84,6 +100,17 @@ project-root/
 ```
 
 ## Extending the Bot
+
+### Migrations
+
+- SQL migrations live under `internal/db/migrations`. They are embedded into the binary and auto-applied on startup.
+- Applied migrations are tracked in the `schema_migrations` table.
+
+### Telegram Flow: Drafts and Targets
+
+- Send a text message or a photo with caption to create a draft post.
+- The bot replies with an inline keyboard to select target platforms (Twitter, Pinterest, Facebook, Instagram, TikTok).
+- Press "Publish" to queue the post (integrations will be wired next).
 
 ### Adding a New Command
 

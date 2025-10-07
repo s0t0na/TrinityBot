@@ -1,13 +1,16 @@
 package bot
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"TrinityBot/internal/config"
+	"TrinityBot/internal/storage"
 )
 
 // Bot represents the Telegram bot
@@ -17,10 +20,11 @@ type Bot struct {
 	updates  tgbotapi.UpdatesChannel
 	server   *http.Server // For webhook mode
 	stopChan chan struct{}
+	repo     storage.PostRepository
 }
 
 // New creates a new bot instance
-func New(cfg *config.Config) (*Bot, error) {
+func New(cfg *config.Config, repo storage.PostRepository) (*Bot, error) {
 	// Initialize Telegram API
 	api, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
 	if err != nil {
@@ -35,6 +39,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		api:      api,
 		config:   cfg,
 		stopChan: make(chan struct{}),
+		repo:     repo,
 	}
 
 	log.Printf("Authorized on account %s", api.Self.UserName)
@@ -132,4 +137,9 @@ func (b *Bot) SendReply(chatID int64, messageID int, text string) (tgbotapi.Mess
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyToMessageID = messageID
 	return b.api.Send(msg)
+}
+
+// helper: context with timeout for DB ops
+func (b *Bot) dbCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 3*time.Second)
 }

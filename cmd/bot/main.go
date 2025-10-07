@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"TrinityBot/internal/bot"
 	"TrinityBot/internal/config"
+	"TrinityBot/internal/db"
+	"TrinityBot/internal/storage"
 )
 
 func main() {
@@ -17,8 +21,20 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	// Connect DB and run migrations
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sqlDB, err := db.Connect(ctx, cfg)
+	if err != nil {
+		log.Fatalf("Failed to connect to DB: %v", err)
+	}
+	defer sqlDB.Close()
+
+	// Repository
+	repo := storage.New(sqlDB)
+
 	// Initialize bot
-	telegramBot, err := bot.New(cfg)
+	telegramBot, err := bot.New(cfg, repo)
 	if err != nil {
 		log.Fatalf("Failed to initialize bot: %v", err)
 	}
