@@ -3,14 +3,16 @@ package bot
 import (
 	"context"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
-	"TrinityBot/internal/config"
-	"TrinityBot/internal/storage"
+	"trinity_bot/internal/config"
+	"trinity_bot/internal/storage"
 )
 
 // Bot represents the Telegram bot
@@ -31,8 +33,8 @@ func New(cfg *config.Config, repo storage.PostRepository) (*Bot, error) {
 		return nil, fmt.Errorf("failed to create Telegram bot: %w", err)
 	}
 
-	// Set debugging mode
-	api.Debug = cfg.DebugMode
+	// Disable tgbotapi internal debug to keep logs JSON-only via slog
+	api.Debug = false
 
 	// Create a bot instance
 	bot := &Bot{
@@ -42,7 +44,7 @@ func New(cfg *config.Config, repo storage.PostRepository) (*Bot, error) {
 		repo:     repo,
 	}
 
-	log.Printf("Authorized on account %s", api.Self.UserName)
+	slog.Info("Authorized on Telegram", "username", api.Self.UserName)
 	return bot, nil
 }
 
@@ -56,6 +58,11 @@ func (b *Bot) Start() error {
 
 // startLongPolling starts the bot with long polling
 func (b *Bot) startLongPolling() error {
+	// Ensure webhook is removed when using long polling to avoid 409 conflicts
+	if _, err := b.api.Request(tgbotapi.DeleteWebhookConfig{DropPendingUpdates: false}); err != nil {
+		slog.Warn("Failed to delete webhook before polling", "err", err)
+	}
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = b.config.UpdateTimeout
 
@@ -90,7 +97,7 @@ func (b *Bot) startWebhook() error {
 	}
 
 	if info.LastErrorDate != 0 {
-		log.Printf("Webhook error: %s", info.LastErrorMessage)
+		slog.Warn("Telegram webhook error", "message", info.LastErrorMessage, "timestamp", info.LastErrorDate)
 	}
 
 	updates := b.api.ListenForWebhook("/" + b.api.Token)
@@ -98,9 +105,9 @@ func (b *Bot) startWebhook() error {
 
 	// Start webhook server
 	go func() {
-		log.Printf("Starting webhook server on port %s", b.config.WebhookPort)
+		slog.Info("Starting webhook server", "port", b.config.WebhookPort)
 		if err := http.ListenAndServe(":"+b.config.WebhookPort, nil); err != nil {
-			log.Printf("ListenAndServe error: %v", err)
+			slog.Error("Webhook server error", "err", err)
 		}
 	}()
 
@@ -142,4 +149,37 @@ func (b *Bot) SendReply(chatID int64, messageID int, text string) (tgbotapi.Mess
 // helper: context with timeout for DB ops
 func (b *Bot) dbCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 3*time.Second)
+}
+
+// downloadTelegramFile downloads a file by its Telegram FileID and returns bytes and content-type.
+func (b *Bot) downloadTelegramFile(ctx context.Context, fileID string) ([]byte, string, error) {
+	f, err := b.api.GetFile(tgbotapi.FileConfig{FileID: fileID})
+	if err != nil {
+		return nil, "", fmt.Errorf("get file: %w", err)
+	}
+	if f.FilePath == "" {
+		return nil, "", fmt.Errorf("empty file path for fileID %s", fileID)
+	}
+	raw := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", url.PathEscape(b.api.Token), f.FilePath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("telegram file download status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	ctype := resp.Header.Get("Content-Type")
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	return data, ctype, nil
 }

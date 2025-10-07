@@ -23,6 +23,16 @@ type Config struct {
 	DBUser      string
 	DBPassword  string
 	DBName      string
+
+	// Twitter (X) credentials (OAuth 1.0a user context)
+	TwitterConsumerKey    string
+	TwitterConsumerSecret string
+	TwitterAccessToken    string
+	TwitterAccessSecret   string
+
+	// Pinterest
+	PinterestAccessToken string
+	PinterestBoardID     string
 }
 
 // Load loads configuration from environment variables
@@ -113,6 +123,16 @@ func Load() (*Config, error) {
 	if config.DBName == "" {
 		config.DBName = os.Getenv("DB_NAME")
 	}
+
+	// Twitter credentials
+	config.TwitterConsumerKey = os.Getenv("TWITTER_CONSUMER_KEY")
+	config.TwitterConsumerSecret = os.Getenv("TWITTER_CONSUMER_SECRET")
+	config.TwitterAccessToken = os.Getenv("TWITTER_ACCESS_TOKEN")
+	config.TwitterAccessSecret = os.Getenv("TWITTER_ACCESS_SECRET")
+
+	// Pinterest
+	config.PinterestAccessToken = os.Getenv("PINTEREST_ACCESS_TOKEN")
+	config.PinterestBoardID = os.Getenv("PINTEREST_BOARD_ID")
 
 	return config, nil
 }

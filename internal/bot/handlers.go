@@ -3,13 +3,15 @@ package bot
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
-	"TrinityBot/internal/storage"
+	"trinity_bot/internal/connectors/pinterest"
+	"trinity_bot/internal/connectors/twitter"
+	"trinity_bot/internal/storage"
 )
 
 // handleUpdate processes a single update from Telegram
@@ -71,7 +73,7 @@ func (b *Bot) handleMessage(message *tgbotapi.Message) {
 		PhotoFileID:    photoID,
 	})
 	if err != nil {
-		log.Printf("create post error: %v", err)
+		slog.Error("Create post error", "err", err)
 		_, _ = b.SendReply(message.Chat.ID, message.MessageID, "Error creating draft. Please try again.")
 		return
 	}
@@ -79,13 +81,13 @@ func (b *Bot) handleMessage(message *tgbotapi.Message) {
 	// Send platform selection UI
 	markup, err := b.buildTargetsMarkup(ctx, id)
 	if err != nil {
-		log.Printf("build markup error: %v", err)
+		slog.Error("Build markup error", "err", err)
 	}
 	textTitle := fmt.Sprintf("Draft created (#%d). Select platforms and press Publish.", id)
 	msg := tgbotapi.NewMessage(message.Chat.ID, textTitle)
 	msg.ReplyMarkup = markup
 	if _, err := b.api.Send(msg); err != nil {
-		log.Printf("send draft msg: %v", err)
+		slog.Error("Send draft message error", "err", err)
 	}
 }
 
@@ -94,7 +96,7 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 	command := message.Command()
 	args := message.CommandArguments()
 
-	log.Printf("Received command from %s: %s %s", message.From.UserName, command, args)
+	slog.Info("Command received", "username", message.From.UserName, "user_id", message.From.ID, "command", command, "args", args)
 
 	switch strings.ToLower(command) {
 	case "start":
@@ -104,14 +106,14 @@ func (b *Bot) handleCommand(message *tgbotapi.Message) {
 	default:
 		_, err := b.SendReply(message.Chat.ID, message.MessageID, "Unknown command. Try /help")
 		if err != nil {
-			log.Printf("Error sending message: %v", err)
+			slog.Error("Send unknown command reply error", "err", err)
 		}
 	}
 }
 
 // handleCallbackQuery processes callback query updates (inline keyboard buttons)
 func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
-	log.Printf("Received callback from %s: %s", query.From.UserName, query.Data)
+	slog.Info("Callback received", "username", query.From.UserName, "user_id", query.From.ID, "data", query.Data)
 
 	// Expect formats:
 	// tgl:<postID>:<platform>
@@ -141,7 +143,7 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 		defer cancel()
 		enabled, err := b.repo.ToggleTarget(ctx, postID64, platform)
 		if err != nil {
-			log.Printf("toggle error: %v", err)
+			slog.Error("Toggle target error", "err", err, "post_id", postID64, "platform", platform)
 			_, _ = b.api.Request(tgbotapi.NewCallback(query.ID, "Error"))
 			return
 		}
@@ -150,7 +152,7 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 		if err == nil {
 			edit := tgbotapi.NewEditMessageReplyMarkup(query.Message.Chat.ID, query.Message.MessageID, markup)
 			if _, err := b.api.Request(edit); err != nil {
-				log.Printf("edit markup: %v", err)
+				slog.Warn("Edit markup failed", "err", err)
 			}
 		}
 		label := "disabled"
@@ -162,18 +164,23 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 		ctx, cancel := b.dbCtx()
 		defer cancel()
 		if err := b.repo.SetPostStatus(ctx, postID64, "queued"); err != nil {
-			log.Printf("queue error: %v", err)
+			slog.Error("Queue post error", "err", err, "post_id", postID64)
 			_, _ = b.api.Request(tgbotapi.NewCallback(query.ID, "Error"))
 			return
 		}
 		_, _ = b.api.Request(tgbotapi.NewCallback(query.ID, "Queued"))
-		msg := tgbotapi.NewMessage(query.Message.Chat.ID, fmt.Sprintf("Post #%d queued for publishing. Integrations coming soon.", postID64))
-		_, _ = b.api.Send(msg)
+		// Attempt immediate publish for selected platforms (Twitter only for now)
+		if err := b.publishSelected(ctx, postID64); err != nil {
+			slog.Error("Publish selected error", "err", err, "post_id", postID64)
+			_, _ = b.api.Send(tgbotapi.NewMessage(query.Message.Chat.ID, fmt.Sprintf("Post #%d queued, publish attempt failed: %v", postID64, err)))
+		} else {
+			_, _ = b.api.Send(tgbotapi.NewMessage(query.Message.Chat.ID, fmt.Sprintf("Post #%d published to selected platforms (where applicable).", postID64)))
+		}
 	case "can":
 		ctx, cancel := b.dbCtx()
 		defer cancel()
 		if err := b.repo.SetPostStatus(ctx, postID64, "canceled"); err != nil {
-			log.Printf("cancel error: %v", err)
+			slog.Error("Cancel post error", "err", err, "post_id", postID64)
 			_, _ = b.api.Request(tgbotapi.NewCallback(query.ID, "Error"))
 			return
 		}
@@ -187,7 +194,7 @@ func (b *Bot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 
 // handleInlineQuery processes inline query updates
 func (b *Bot) handleInlineQuery(query *tgbotapi.InlineQuery) {
-	log.Printf("Received inline query from %s: %s", query.From.UserName, query.Query)
+	slog.Info("Inline query", "username", query.From.UserName, "user_id", query.From.ID, "query", query.Query)
 
 	// Create some results (replace with your logic)
 	results := []interface{}{
@@ -207,7 +214,7 @@ func (b *Bot) handleInlineQuery(query *tgbotapi.InlineQuery) {
 
 	_, err := b.api.Request(inlineResponse)
 	if err != nil {
-		log.Printf("Error answering inline query: %v", err)
+		slog.Error("Answer inline query error", "err", err)
 	}
 }
 
@@ -217,7 +224,7 @@ func (b *Bot) handleStartCommand(message *tgbotapi.Message) {
 	welcomeText := "Welcome to the bot! Type /help to see available commands."
 	_, err := b.SendMessage(message.Chat.ID, welcomeText)
 	if err != nil {
-		log.Printf("Error sending message: %v", err)
+		slog.Error("Send welcome error", "err", err)
 	}
 }
 
@@ -231,7 +238,7 @@ Use the buttons to select platforms and publish.
 `
 	_, err := b.SendMessage(message.Chat.ID, helpText)
 	if err != nil {
-		log.Printf("Error sending message: %v", err)
+		slog.Error("Send help error", "err", err)
 	}
 }
 
@@ -267,3 +274,120 @@ func (b *Bot) buildTargetsMarkup(ctx context.Context, postID int64) (tgbotapi.In
 
 	return tgbotapi.NewInlineKeyboardMarkup(row1, row2, actions), nil
 }
+
+// publishSelected publishes the post to all currently selected targets.
+func (b *Bot) publishSelected(ctx context.Context, postID int64) error {
+	selections, err := b.repo.ListTargets(ctx, postID)
+	if err != nil {
+		return err
+	}
+	post, err := b.repo.GetPost(ctx, postID)
+	if err != nil {
+		return err
+	}
+	if selections["twitter"] {
+		if err := b.publishToTwitter(ctx, post); err != nil {
+			return err
+		}
+	}
+	if selections["pinterest"] {
+		if err := b.publishToPinterest(ctx, post); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Bot) publishToTwitter(ctx context.Context, p *storage.Post) error {
+	if b.config.TwitterConsumerKey == "" || b.config.TwitterConsumerSecret == "" || b.config.TwitterAccessToken == "" || b.config.TwitterAccessSecret == "" {
+		msg := "Twitter credentials missing"
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "twitter", "failed", nil, &msg)
+		_ = b.repo.AddLog(ctx, p.ID, ptr("twitter"), "error", msg)
+		return fmt.Errorf(msg)
+	}
+	twc, err := twitter.New(twitter.Credentials{
+		ConsumerKey:    b.config.TwitterConsumerKey,
+		ConsumerSecret: b.config.TwitterConsumerSecret,
+		AccessToken:    b.config.TwitterAccessToken,
+		AccessSecret:   b.config.TwitterAccessSecret,
+	})
+	if err != nil {
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "twitter", "failed", nil, strptr(err.Error()))
+		_ = b.repo.AddLog(ctx, p.ID, ptr("twitter"), "error", err.Error())
+		return err
+	}
+
+	var media [][]byte
+	var mediaTypes []string
+	if p.PhotoFileID != nil {
+		data, ctype, err := b.downloadTelegramFile(ctx, *p.PhotoFileID)
+		if err != nil {
+			_ = b.repo.SetTargetStatus(ctx, p.ID, "twitter", "failed", nil, strptr(err.Error()))
+			_ = b.repo.AddLog(ctx, p.ID, ptr("twitter"), "error", "telegram download: "+err.Error())
+			return err
+		}
+		if ctype == "application/octet-stream" || ctype == "" {
+			ctype = "image/jpeg"
+		}
+		media = append(media, data)
+		mediaTypes = append(mediaTypes, ctype)
+	}
+	tweetID, err := twc.Publish(ctx, p.TextContent, media, mediaTypes)
+	if err != nil {
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "twitter", "failed", nil, strptr(err.Error()))
+		_ = b.repo.AddLog(ctx, p.ID, ptr("twitter"), "error", err.Error())
+		return err
+	}
+	_ = b.repo.SetTargetStatus(ctx, p.ID, "twitter", "published", &tweetID, nil)
+	_ = b.repo.AddLog(ctx, p.ID, ptr("twitter"), "published", "tweet_id="+tweetID)
+	return nil
+}
+
+func (b *Bot) publishToPinterest(ctx context.Context, p *storage.Post) error {
+	if b.config.PinterestAccessToken == "" || b.config.PinterestBoardID == "" {
+		msg := "Pinterest token or board ID missing"
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "pinterest", "failed", nil, &msg)
+		_ = b.repo.AddLog(ctx, p.ID, ptr("pinterest"), "error", msg)
+		return fmt.Errorf(msg)
+	}
+	if p.PhotoFileID == nil {
+		msg := "Pinterest requires an image"
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "pinterest", "failed", nil, &msg)
+		_ = b.repo.AddLog(ctx, p.ID, ptr("pinterest"), "error", msg)
+		return fmt.Errorf(msg)
+	}
+	// Download image from Telegram
+	data, ctype, err := b.downloadTelegramFile(ctx, *p.PhotoFileID)
+	if err != nil {
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "pinterest", "failed", nil, strptr(err.Error()))
+		_ = b.repo.AddLog(ctx, p.ID, ptr("pinterest"), "error", "telegram download: "+err.Error())
+		return err
+	}
+	if ctype == "" {
+		ctype = "image/jpeg"
+	}
+	// Create client and pin
+	cli, err := pinterest.New(pinterest.Credentials{AccessToken: b.config.PinterestAccessToken})
+	if err != nil {
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "pinterest", "failed", nil, strptr(err.Error()))
+		_ = b.repo.AddLog(ctx, p.ID, ptr("pinterest"), "error", err.Error())
+		return err
+	}
+	// Pinterest recommends short title; use truncated text if present
+	title := p.TextContent
+	if len(title) > 100 {
+		title = title[:100]
+	}
+	pinID, err := cli.CreatePin(ctx, b.config.PinterestBoardID, title, p.TextContent, "", data, ctype)
+	if err != nil {
+		_ = b.repo.SetTargetStatus(ctx, p.ID, "pinterest", "failed", nil, strptr(err.Error()))
+		_ = b.repo.AddLog(ctx, p.ID, ptr("pinterest"), "error", err.Error())
+		return err
+	}
+	_ = b.repo.SetTargetStatus(ctx, p.ID, "pinterest", "published", &pinID, nil)
+	_ = b.repo.AddLog(ctx, p.ID, ptr("pinterest"), "published", "pin_id="+pinID)
+	return nil
+}
+
+func ptr[T any](v T) *T       { return &v }
+func strptr(s string) *string { return &s }

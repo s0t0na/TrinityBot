@@ -64,6 +64,8 @@ The bot can be configured using environment variables:
 - `ALLOWED_USERS` (optional): Comma-separated list of allowed user IDs
 - `DATABASE_URL` (recommended): Postgres connection string. If empty, the app falls back to `POSTGRES_*` variables.
 - `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` (fallback if `DATABASE_URL` not set)
+- `TWITTER_CONSUMER_KEY`, `TWITTER_CONSUMER_SECRET`, `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_SECRET` for X/Twitter posting
+ - `PINTEREST_ACCESS_TOKEN`, `PINTEREST_BOARD_ID` for Pinterest posting
 
 ## Project Structure
 
@@ -111,6 +113,8 @@ project-root/
 - Send a text message or a photo with caption to create a draft post.
 - The bot replies with an inline keyboard to select target platforms (Twitter, Pinterest, Facebook, Instagram, TikTok).
 - Press "Publish" to queue the post (integrations will be wired next).
+- X/Twitter connector: When selected, pressing Publish attempts to post immediately (text and images supported).
+- Pinterest connector: Requires an image; pressing Publish will upload the photo and create a pin on the configured board.
 
 ### Adding a New Command
 

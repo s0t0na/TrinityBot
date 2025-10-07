@@ -11,7 +11,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"TrinityBot/internal/config"
+	"trinity_bot/internal/config"
 )
 
 // Connect opens a PostgreSQL connection using config and runs migrations.

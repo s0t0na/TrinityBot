@@ -1,7 +1,7 @@
 package bot
 
 import (
-	"log"
+	"log/slog"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -48,8 +48,12 @@ func logUpdate(update tgbotapi.Update) {
 		updateType = "Other"
 	}
 
-	log.Printf("Update received - Type: %s, User: %s (ID: %d), Content: %s",
-		updateType, userName, userID, content)
+	slog.Debug("Update received",
+		"type", updateType,
+		"user", userName,
+		"user_id", userID,
+		"content", content,
+	)
 }
 
 // isAuthorized checks if a user is authorized to use the bot
@@ -79,6 +83,6 @@ func (b *Bot) isAuthorized(update tgbotapi.Update) bool {
 	}
 
 	// User not in allowed list
-	log.Printf("Unauthorized access attempt from user ID: %d", userID)
+	slog.Warn("Unauthorized access attempt", "user_id", userID)
 	return false
 }

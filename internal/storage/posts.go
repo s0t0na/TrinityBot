@@ -40,6 +40,9 @@ type PostRepository interface {
 	ToggleTarget(ctx context.Context, postID int64, platform string) (bool, error)
 	ListTargets(ctx context.Context, postID int64) (map[string]bool, error)
 	SetPostStatus(ctx context.Context, postID int64, status string) error
+	GetPost(ctx context.Context, id int64) (*Post, error)
+	SetTargetStatus(ctx context.Context, postID int64, platform string, status string, externalID *string, errText *string) error
+	AddLog(ctx context.Context, postID int64, platform *string, event, detail string) error
 }
 
 type repo struct {
@@ -115,6 +118,43 @@ func (r *repo) SetPostStatus(ctx context.Context, postID int64, status string) e
 	_, err := r.db.ExecContext(ctx, `UPDATE posts SET status=$2, updated_at=NOW() WHERE id=$1`, postID, status)
 	if err != nil {
 		return fmt.Errorf("set post status: %w", err)
+	}
+	return nil
+}
+
+func (r *repo) GetPost(ctx context.Context, id int64) (*Post, error) {
+	row := r.db.QueryRowContext(ctx, `SELECT id, telegram_user_id, chat_id, message_id, type, text_content, photo_file_id, status, created_at, updated_at FROM posts WHERE id=$1`, id)
+	var p Post
+	var photo sql.NullString
+	if err := row.Scan(&p.ID, &p.TelegramUserID, &p.ChatID, &p.MessageID, &p.Type, &p.TextContent, &photo, &p.Status, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("post %d not found", id)
+		}
+		return nil, err
+	}
+	if photo.Valid {
+		v := photo.String
+		p.PhotoFileID = &v
+	}
+	return &p, nil
+}
+
+func (r *repo) SetTargetStatus(ctx context.Context, postID int64, platform string, status string, externalID *string, errText *string) error {
+	// upsert target row
+	_, err := r.db.ExecContext(ctx, `INSERT INTO post_targets (post_id, platform, status, external_post_id, error)
+        VALUES ($1,$2,$3,$4,$5)
+        ON CONFLICT (post_id, platform) DO UPDATE SET status=EXCLUDED.status, external_post_id=EXCLUDED.external_post_id, error=EXCLUDED.error, updated_at=NOW()`,
+		postID, strings.ToLower(platform), status, externalID, errText)
+	if err != nil {
+		return fmt.Errorf("set target status: %w", err)
+	}
+	return nil
+}
+
+func (r *repo) AddLog(ctx context.Context, postID int64, platform *string, event, detail string) error {
+	_, err := r.db.ExecContext(ctx, `INSERT INTO post_logs (post_id, platform, event, detail) VALUES ($1,$2,$3,$4)`, postID, platform, event, detail)
+	if err != nil {
+		return fmt.Errorf("add log: %w", err)
 	}
 	return nil
 }
